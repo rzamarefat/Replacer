@@ -12,5 +12,9 @@ groundingdino_config = {
 
 }
 
+fastsam_config = {
+    "fastsam_checkpoint": os.path.join(root_path, "pretrained_weights", "FastSAM-x.pt"),
+}
+
 
 

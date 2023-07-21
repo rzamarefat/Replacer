@@ -6,7 +6,6 @@ from PIL import Image
 
 
 replacer = Replacer()
-print("====================================pppppp")
 input_image = Image.open("/home/evobits/vyrodrive/rzamarefat/Replacer/test_images/01.jpg")
 
 grounding_caption = "replace the car with a monkey"
