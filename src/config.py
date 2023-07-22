@@ -17,4 +17,10 @@ fastsam_config = {
 }
 
 
-
+controlnet_config = {
+    "save_memory": False,
+    "model_name": "control_v11p_sd15_inpaint",
+    "path_to_config_yaml_file": "/home/evobits/vyrodrive/rzamarefat/Replacer/src/controlnet/models",
+    "path_to_sd_model":"/home/evobits/vyrodrive/rzamarefat/Replacer/pretrained_weights/v1-5-pruned.ckpt",
+    "path_to_cldm": "/home/evobits/vyrodrive/rzamarefat/Replacer/pretrained_weights/control_v11p_sd15_inpaint.pth",
+}

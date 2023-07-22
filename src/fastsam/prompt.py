@@ -168,6 +168,7 @@ class FastSAMPrompt:
                 contours, hierarchy = cv2.findContours(annotation, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
                 for contour in contours:
                     contour_all.append(contour)
+                    
             cv2.drawContours(temp, contour_all, -1, (255, 255, 255), 2)
             color = np.array([0 / 255, 0 / 255, 255 / 255, 0.8])
             contour_mask = temp / 255 * color.reshape(1, 1, -1)
@@ -215,7 +216,11 @@ class FastSAMPrompt:
         path = os.path.dirname(os.path.abspath(output_path))
         if not os.path.exists(path):
             os.makedirs(path)
+
+
+        print("====>result.shape", result.shape)
         result = result[:, :, ::-1]
+        print("====>result.shape", result.shape)
         cv2.imwrite(output_path, result)
      
     #   CPU post process

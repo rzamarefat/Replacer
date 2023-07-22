@@ -15,11 +15,30 @@ from src.groundingdino.util.inference import annotate, load_image, predict
 import src.groundingdino.datasets.transforms as T
 from huggingface_hub import hf_hub_download
 import warnings
-import torch
 from src.segment_anything import sam_model_registry, SamPredictor
 import matplotlib.pyplot as plt
-from .config import groundingdino_config, fastsam_config
+from .config import *
 from src.fastsam import FastSAM, FastSAMPrompt
+import torch
+import os
+
+from src.controlnet.share import *
+
+
+import cv2
+import einops
+import gradio as gr
+import numpy as np
+
+import random
+
+from pytorch_lightning import seed_everything
+from src.controlnet.annotator.util import resize_image, HWC3
+from src.controlnet.cldm.model import create_model, load_state_dict
+from src.controlnet.cldm.ddim_hacked import DDIMSampler
+
+
+
 
 
 
@@ -41,6 +60,15 @@ class Replacer:
 
         self._fastsam_checkpoint = fastsam_config["fastsam_checkpoint"]
         self._fastsam_model = FastSAM(fastsam_config["fastsam_checkpoint"])
+
+
+
+        self._controlnet_model_name = controlnet_config['model_name']
+        self._controlnet_model = create_model(os.path.join(controlnet_config["path_to_config_yaml_file"], f"{self._controlnet_model_name}.yaml")).cpu()
+        self._controlnet_model.load_state_dict(load_state_dict(controlnet_config["path_to_sd_model"], location=self.device), strict=False)
+        self._controlnet_model.load_state_dict(load_state_dict(controlnet_config["path_to_cldm"], location=self.device), strict=False)
+        self._controlnet_model = self._controlnet_model.cuda()
+        self._ddim_sampler = DDIMSampler(self._controlnet_model)
 
     def _load_model_groundingdino(self, model_config_path, repo_id, filename, device='cpu'):
         args = SLConfig.fromfile(model_config_path) 
@@ -132,27 +160,141 @@ class Replacer:
         w, h = box[2] - box[0], box[3] - box[1]
         ax.add_patch(plt.Rectangle((x0, y0), w, h, edgecolor='green', facecolor=(0,0,0,0), lw=2))  
 
+
+    def _do_controlnet_process(self, 
+                               input_image, 
+                               input_mask,
+                               prompt, 
+                               a_prompt, 
+                               n_prompt, 
+                               num_samples, 
+                               image_resolution, 
+                               ddim_steps, 
+                               guess_mode, 
+                               strength, 
+                               scale, 
+                               seed, 
+                               eta, 
+                               mask_blur):
+        with torch.no_grad():
+            input_image = HWC3(input_image)
+            
+
+            img_raw = resize_image(input_image, image_resolution).astype(np.float32)
+            H, W, C = img_raw.shape
+            
+            mask_pixel = cv2.resize(input_mask, (W, H), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
+            mask_pixel = cv2.GaussianBlur(mask_pixel, (0, 0), mask_blur)
+
+            mask_latent = cv2.resize(mask_pixel, (W // 8, H // 8), interpolation=cv2.INTER_AREA)
+
+            detected_map = img_raw.copy()
+            detected_map[mask_pixel > 0.5] = - 255.0
+
+            control = torch.from_numpy(detected_map.copy()).float().cuda() / 255.0
+            control = torch.stack([control for _ in range(num_samples)], dim=0)
+            control = einops.rearrange(control, 'b h w c -> b c h w').clone()
+
+            mask = 1.0 - torch.from_numpy(mask_latent.copy()).float().cuda()
+            mask = torch.stack([mask for _ in range(num_samples)], dim=0)
+            mask = einops.rearrange(mask, 'b h w -> b 1 h w').clone()
+
+            x0 = torch.from_numpy(img_raw.copy()).float().cuda() / 127.0 - 1.0
+            x0 = torch.stack([x0 for _ in range(num_samples)], dim=0)
+            x0 = einops.rearrange(x0, 'b h w c -> b c h w').clone()
+
+            mask_pixel_batched = mask_pixel[None, :, :, None]
+            img_pixel_batched = img_raw.copy()[None]
+
+            if seed == -1:
+                seed = random.randint(0, 65535)
+            seed_everything(seed)
+
+            if controlnet_config["save_memory"]:
+                self._controlnet_model.low_vram_shift(is_diffusing=False)
+
+            cond = {"c_concat": [control], "c_crossattn": [self._controlnet_model.get_learned_conditioning([prompt + ', ' + a_prompt] * num_samples)]}
+            un_cond = {"c_concat": None if guess_mode else [control], "c_crossattn": [self._controlnet_model.get_learned_conditioning([n_prompt] * num_samples)]}
+            shape = (4, H // 8, W // 8)
+
+            if controlnet_config["save_memory"]:
+                self._controlnet_model.low_vram_shift(is_diffusing=False)
+
+            self._ddim_sampler.make_schedule(ddim_steps, ddim_eta=eta, verbose=True)
+            x0 = self._controlnet_model.get_first_stage_encoding(self._controlnet_model.encode_first_stage(x0))
+
+            if controlnet_config["save_memory"]:
+                self._controlnet_model.low_vram_shift(is_diffusing=True)
+
+            self._controlnet_model.control_scales = [strength * (0.825 ** float(12 - i)) for i in range(13)] if guess_mode else ([strength] * 13)
+            # Magic number. IDK why. Perhaps because 0.825**12<0.01 but 0.826**12>0.01
+
+            samples, intermediates = self._ddim_sampler.sample(ddim_steps, num_samples,
+                                                        shape, cond, verbose=False, eta=eta,
+                                                        unconditional_guidance_scale=scale,
+                                                        unconditional_conditioning=un_cond, x0=x0, mask=mask)
+
+            if controlnet_config["save_memory"]:
+                self._controlnet_model.low_vram_shift(is_diffusing=False)
+
+            x_samples = self._controlnet_model.decode_first_stage(samples)
+            x_samples = (einops.rearrange(x_samples, 'b c h w -> b h w c') * 127.5 + 127.5).cpu().numpy().astype(np.float32)
+            x_samples = x_samples * mask_pixel_batched + img_pixel_batched * (1.0 - mask_pixel_batched)
+
+            results = [x_samples[i].clip(0, 255).astype(np.uint8) for i in range(num_samples)]
+        return [detected_map.clip(0, 255).astype(np.uint8)] + results
+
     
-    def replace(self, input_image, grounding_caption):
+    def replace(self, 
+                input_image, 
+                caption,
+                a_prompt, 
+                n_prompt, 
+                num_samples, 
+                image_resolution, 
+                ddim_steps, 
+                guess_mode, 
+                strength, 
+                scale, 
+                seed, 
+                eta, 
+                mask_blur
+                ):
+
         image_width, image_height = input_image.size
 
-        xywh_boxes = self._run_grounding(input_image, grounding_caption)
+        xywh_boxes = self._run_grounding(input_image, caption)
 
         input_image = np.array(input_image)
         input_image = cv2.cvtColor(input_image, cv2.COLOR_BGR2RGB)
 
 
         xyxy_boxes = self._convert_xywh_to_xyxy(xywh_boxes, image_width, image_height, return_np=False)
+
         everything_results = self._fastsam_model(input_image, device=self.device, retina_masks=True, imgsz=1024, conf=0.4, iou=0.9,)
         prompt_process = FastSAMPrompt(input_image, everything_results, device=self.device)
         ann = prompt_process.box_prompt(bboxes=xyxy_boxes)
-        # print("ann", ann, type(ann))
-        prompt_process.plot(annotations=ann,output_path='./ANN.jpg',)
 
+        for mask in ann:
+            mask *= 255
+            input_mask = mask.astype(np.uint8)
 
-        
+            result = self._do_controlnet_process(input_image, 
+                                        input_mask, 
+                                        caption, 
+                                        a_prompt, 
+                                        n_prompt, 
+                                        num_samples, 
+                                        image_resolution, 
+                                        ddim_steps, 
+                                        guess_mode, 
+                                        strength, 
+                                        scale, 
+                                        seed, 
+                                        eta, 
+                                        mask_blur)
 
-
+            return result
 
 
 
